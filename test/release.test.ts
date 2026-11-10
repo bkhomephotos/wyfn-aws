@@ -51,11 +51,15 @@ const run = (t: string, c = cfg(), l = new MemoryLedger(), at = NOW) => decide(t
 
 test('grantSpec here is byte for byte the site’s (shared format)', () => {
   const here = readFileSync(new URL('../release/grantSpec.ts', import.meta.url));
+  // The pinned hash (release/grantSpec.sha256, the same file in the site repo): a change made in one repo only fails
+  // here or there, whichever repo is checked out.
+  const pinned = readFileSync(new URL('../release/grantSpec.sha256', import.meta.url), 'utf8').split(/\s+/)[0];
+  assert.equal(createHash('sha256').update(here).digest('hex'), pinned, 'grantSpec.ts changed: copy it to the site and update grantSpec.sha256 in both repos');
   let site = Buffer.alloc(0);
   try {
     site = readFileSync('/home/claude/wyfilingnotices/netlify/lib/automation/grantSpec.ts');
   } catch {
-    return; // the site repo isn't beside this one: CI compares the pinned hash instead
+    return; // the site repo isn't beside this one: the pinned hash above is the check
   }
   assert.equal(createHash('sha256').update(here).digest('hex'), createHash('sha256').update(site).digest('hex'));
 });

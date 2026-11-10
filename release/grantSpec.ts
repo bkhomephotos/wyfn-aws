@@ -9,8 +9,11 @@
 //          function records its jti with a conditional write). Names one order, one Filing ID and report year, one
 //          Wyoming invoice, one exact amount, one card slot, one attempt, one worker and lease generation.
 // Approval  BK's passkey (WebAuthn) signature over the SHA-256 of one ApprovalPayload. The release function checks
-//          it against BK's public key, which is stored in AWS, so even a compromised site cannot approve a payment over
-//          the automatic limit, or (in the attended pilot) any payment, without BK's own key.
+//          it against BK's public keys as stored in AWS, so nothing that only reaches the site (a stolen session, a
+//          PIN read from BK's email, a forged request) can approve a payment. Limit: a passkey prompt does not show
+//          what is being signed, so a site whose code was taken over could present an approval's challenge as an
+//          ordinary sign-in and get it signed. The release function's own caps (per hour, per day, approvals used
+//          once) bound that case; a passkey kept only for approvals (a hardware key) makes an unexpected prompt visible.
 
 import { createHash, createPublicKey, sign as edSign, verify as cryptoVerify, type KeyObject } from 'node:crypto';
 
@@ -174,7 +177,7 @@ export function approvalMatchesGrant(c: GrantClaims, nowS: number): string | nul
 
 export interface PasskeyKey {
   credentialId: string;
-  /** SPKI DER, base64. ES256 (P-256) or Ed25519. */
+  /** SPKI DER, base64. ES256 (P-256), Ed25519, or RS256 (RSA, 2048 bits or more: Windows Hello). */
   spki: string;
 }
 
@@ -198,6 +201,7 @@ export function verifyPasskeyApproval(
   } catch {
     return 'unreadable client data';
   }
+  if (!client || typeof client !== 'object') return 'unreadable client data';
   if (client.type !== 'webauthn.get') return 'not an assertion';
   if (client.challenge !== approvalChallenge(approval.payload)) return 'challenge is not this approval';
   if (client.origin !== expect.origin) return 'wrong origin';
@@ -219,7 +223,10 @@ export function verifyPasskeyApproval(
   const sig = fromB64u(a.signature);
   let good = false;
   try {
-    good = pub.asymmetricKeyType === 'ed25519' ? cryptoVerify(null, signed, pub, sig) : cryptoVerify('sha256', signed, { key: pub, dsaEncoding: 'der' }, sig);
+    if (pub.asymmetricKeyType === 'ed25519') good = cryptoVerify(null, signed, pub, sig);
+    else if (pub.asymmetricKeyType === 'ec' && pub.asymmetricKeyDetails?.namedCurve === 'prime256v1') good = cryptoVerify('sha256', signed, { key: pub, dsaEncoding: 'der' }, sig);
+    else if (pub.asymmetricKeyType === 'rsa' && (pub.asymmetricKeyDetails?.modulusLength ?? 0) >= 2048) good = cryptoVerify('sha256', signed, pub, sig); // RS256: PKCS#1 v1.5
+    else return 'unsupported key type';
   } catch {
     good = false;
   }
