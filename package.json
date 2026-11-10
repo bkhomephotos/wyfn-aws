@@ -1,0 +1,16 @@
+{
+  "name": "wyfn-aws",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "WY Filing Notices: the dedicated AWS account for the filing worker and card release. Infrastructure as code plus the release function and the card-alert parser.",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.0",
+    "tsx": "4.23.15",
+    "typescript": "7.0.2"
+  }
+}

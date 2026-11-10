@@ -1,0 +1,265 @@
+# WY Filing Notices: the dedicated AWS account's resources (us-east-1). NOT DEPLOYED. Review, then create the stack
+# from the AWS console (CloudFormation > Create stack > Upload) in the NEW account only, after BK approves the cost.
+#
+# Trust zones: the worker (no inbound, no public address, no stored keys) reaches the internet only through the
+# egress proxy (domain allowlist with SNI checked against the CONNECT host), and AWS APIs only through VPC endpoints
+# whose policies allow this account's own resources. No AWS hostname is on the proxy allowlist: a shared AWS API
+# endpoint reachable through the proxy would let a compromised worker send data into an attacker's own account.
+AWSTemplateFormatVersion: '2010-09-09'
+Description: WYFN filing worker, card release function, grant ledger, alerting (single-purpose account)
+
+Parameters:
+  OwnerEmail: { Type: String, Default: hello@bkhomephotos.com }
+  WorkerAmiId: { Type: AWS::EC2::Image::Id, Description: The approved worker image (EC2 Image Builder output, one per release) }
+  ProxyAmiId: { Type: AWS::EC2::Image::Id, Description: Ubuntu 24.04 arm64 for the proxy }
+  PaymentHost: { Type: String, Description: The payment page's exact host, recorded in Phase 0 (e.g. www.convergepay.com) }
+  SiteHost: { Type: String, Default: wyfilingnotices.com }
+
+Resources:
+  # ---------- network ----------
+  Vpc: { Type: AWS::EC2::VPC, Properties: { CidrBlock: 10.40.0.0/16, EnableDnsSupport: true, EnableDnsHostnames: true } }
+  WorkerSubnetA: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.1.0/24, AvailabilityZone: !Select [0, !GetAZs ''] } }
+  WorkerSubnetB: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.2.0/24, AvailabilityZone: !Select [1, !GetAZs ''] } }
+  ProxySubnet: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.10.0/24, AvailabilityZone: !Select [0, !GetAZs ''] } }
+  Igw: { Type: AWS::EC2::InternetGateway }
+  IgwAttach: { Type: AWS::EC2::VPCGatewayAttachment, Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw } }
+  ProxyRoutes: { Type: AWS::EC2::RouteTable, Properties: { VpcId: !Ref Vpc } }
+  ProxyDefault: { Type: AWS::EC2::Route, DependsOn: IgwAttach, Properties: { RouteTableId: !Ref ProxyRoutes, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw } }
+  ProxyRoutesAssoc: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref ProxySubnet, RouteTableId: !Ref ProxyRoutes } }
+  # The worker subnets have NO route to the internet at all: only the VPC (proxy, endpoints).
+  WorkerRoutes: { Type: AWS::EC2::RouteTable, Properties: { VpcId: !Ref Vpc } }
+  WorkerAssocA: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref WorkerSubnetA, RouteTableId: !Ref WorkerRoutes } }
+  WorkerAssocB: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref WorkerSubnetB, RouteTableId: !Ref WorkerRoutes } }
+
+  WorkerSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: worker - no inbound; out only to the proxy and the endpoints
+      SecurityGroupEgress:
+        - { IpProtocol: tcp, FromPort: 3128, ToPort: 3128, DestinationSecurityGroupId: !Ref ProxySg }
+        - { IpProtocol: tcp, FromPort: 443, ToPort: 443, DestinationSecurityGroupId: !Ref EndpointSg }
+  ProxySg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: egress proxy - in from the worker only
+      SecurityGroupEgress: [{ IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }, { IpProtocol: udp, FromPort: 53, ToPort: 53, CidrIp: 10.40.0.2/32 }]
+  ProxyIngress: { Type: AWS::EC2::SecurityGroupIngress, Properties: { GroupId: !Ref ProxySg, IpProtocol: tcp, FromPort: 3128, ToPort: 3128, SourceSecurityGroupId: !Ref WorkerSg } }
+  EndpointSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties: { VpcId: !Ref Vpc, GroupDescription: VPC endpoints - in from the worker only, SecurityGroupEgress: [{ IpProtocol: '-1', CidrIp: 127.0.0.1/32 }] }
+  EndpointIngress: { Type: AWS::EC2::SecurityGroupIngress, Properties: { GroupId: !Ref EndpointSg, IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref WorkerSg } }
+
+  # Endpoints, one AZ each (about $7.30 a month each). Their policies admit only this account's own resources.
+  LambdaEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.lambda
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref WorkerSubnetA]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PolicyDocument:
+        Statement: [{ Effect: Allow, Principal: '*', Action: lambda:InvokeFunction, Resource: !GetAtt ReleaseFunction.Arn }]
+  SecretsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref WorkerSubnetA]
+      SecurityGroupIds: [!Ref EndpointSg]
+      PolicyDocument:
+        Statement: [{ Effect: Allow, Principal: '*', Action: secretsmanager:GetSecretValue, Resource: !Ref WorkerKeySecret }]
+
+  # ---------- keys and secrets ----------
+  CardKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    Properties:
+      Description: decrypts card secrets; usable by the release function only
+      PendingWindowInDays: 30
+      EnableKeyRotation: true
+      KeyPolicy:
+        Statement:
+          - { Sid: Admin, Effect: Allow, Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }, Action: ['kms:Create*', 'kms:Describe*', 'kms:Enable*', 'kms:List*', 'kms:Put*', 'kms:Update*', 'kms:Revoke*', 'kms:Disable*', 'kms:Get*', 'kms:Delete*', 'kms:TagResource', 'kms:UntagResource', 'kms:ScheduleKeyDeletion', 'kms:CancelKeyDeletion', 'kms:Encrypt'], Resource: '*' }
+          - { Sid: ReleaseDecrypt, Effect: Allow, Principal: { AWS: !GetAtt ReleaseRole.Arn }, Action: kms:Decrypt, Resource: '*' }
+          # Nothing else may decrypt, whatever an IAM policy says (the account root keeps admin, not use).
+          - Sid: DenyOtherDecrypt
+            Effect: Deny
+            Principal: '*'
+            Action: kms:Decrypt
+            Resource: '*'
+            Condition: { ArnNotEquals: { 'aws:PrincipalArn': !GetAtt ReleaseRole.Arn } }
+  CardKeyAlias: { Type: AWS::KMS::Alias, Properties: { AliasName: alias/wyfn-card, TargetKeyId: !Ref CardKey } }
+  CardPrimarySecret: { Type: AWS::SecretsManager::Secret, Properties: { Name: wyfn/card/chase, KmsKeyId: !Ref CardKey, Description: 'Chase employee card. Value set by BK with scripts/card-provision.sh, never by anything else' } }
+  CardBackupSecret: { Type: AWS::SecretsManager::Secret, Properties: { Name: wyfn/card/debit, KmsKeyId: !Ref CardKey, Description: 'Virtual debit card. Value set by BK with scripts/card-provision.sh' } }
+  WorkerKeySecret: { Type: AWS::SecretsManager::Secret, Properties: { Name: wyfn/worker-key, GenerateSecretString: { PasswordLength: 64, ExcludePunctuation: true } } }
+  CardSecretPolicyPrimary:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref CardPrimarySecret
+      ResourcePolicy:
+        Statement: [{ Effect: Deny, Principal: '*', Action: secretsmanager:GetSecretValue, Resource: '*', Condition: { ArnNotEquals: { 'aws:PrincipalArn': !GetAtt ReleaseRole.Arn } } }]
+  CardSecretPolicyBackup:
+    Type: AWS::SecretsManager::ResourcePolicy
+    Properties:
+      SecretId: !Ref CardBackupSecret
+      ResourcePolicy:
+        Statement: [{ Effect: Deny, Principal: '*', Action: secretsmanager:GetSecretValue, Resource: '*', Condition: { ArnNotEquals: { 'aws:PrincipalArn': !GetAtt ReleaseRole.Arn } } }]
+
+  # ---------- ledger and config (kill switch, caps, keys): written by BK in the console, read by the function ----------
+  Ledger:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: wyfn-release
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: pk, AttributeType: S }]
+      KeySchema: [{ AttributeName: pk, KeyType: HASH }]
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  # ---------- the release function ----------
+  ReleaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }] }
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: release
+          PolicyDocument:
+            Statement:
+              - { Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: [!Ref CardPrimarySecret, !Ref CardBackupSecret] }
+              - { Effect: Allow, Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:ConditionCheckItem], Resource: !GetAtt Ledger.Arn }
+  ReleaseFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: wyfn-release
+      Runtime: nodejs22.x
+      Handler: handler.handler
+      Role: !GetAtt ReleaseRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      ReservedConcurrentExecutions: 2
+      Environment: { Variables: { LEDGER_TABLE: wyfn-release } }
+      Code: { ZipFile: "exports.handler = async () => ({ ok: false, why: 'not deployed: upload the reviewed release build' });" }
+  ReleaseInvoke: { Type: AWS::Lambda::Permission, Properties: { FunctionName: !Ref ReleaseFunction, Action: lambda:InvokeFunction, Principal: !GetAtt WorkerRole.Arn } }
+
+  # ---------- the worker ----------
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }] }
+      Policies:
+        - PolicyName: worker
+          PolicyDocument:
+            Statement:
+              - { Effect: Allow, Action: lambda:InvokeFunction, Resource: !GetAtt ReleaseFunction.Arn }
+              - { Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref WorkerKeySecret }
+  WorkerProfile: { Type: AWS::IAM::InstanceProfile, Properties: { Roles: [!Ref WorkerRole] } }
+  WorkerTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref WorkerAmiId
+        InstanceType: t3.medium
+        IamInstanceProfile: { Arn: !GetAtt WorkerProfile.Arn }
+        MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
+        NetworkInterfaces: [{ DeviceIndex: 0, AssociatePublicIpAddress: false, Groups: [!Ref WorkerSg] }]
+        BlockDeviceMappings: [{ DeviceName: /dev/sda1, Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true } }]
+  WorkerGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      MinSize: '1'
+      MaxSize: '1'
+      DesiredCapacity: '1'
+      VPCZoneIdentifier: [!Ref WorkerSubnetA, !Ref WorkerSubnetB]
+      LaunchTemplate: { LaunchTemplateId: !Ref WorkerTemplate, Version: !GetAtt WorkerTemplate.LatestVersionNumber }
+      HealthCheckType: EC2
+
+  # ---------- the egress proxy (Squid: CONNECT only to the allowlist, SNI must equal the CONNECT host) ----------
+  ProxyEip: { Type: AWS::EC2::EIP }
+  Proxy:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ProxyAmiId
+      InstanceType: t4g.nano
+      SubnetId: !Ref ProxySubnet
+      SecurityGroupIds: [!Ref ProxySg]
+      MetadataOptions: { HttpTokens: required }
+      BlockDeviceMappings: [{ DeviceName: /dev/sda1, Ebs: { VolumeSize: 8, VolumeType: gp3, Encrypted: true } }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          apt-get update && apt-get -y install squid-openssl
+          cat > /etc/squid/squid.conf <<CONF
+          http_port 3128 ssl-bump generate-host-certificates=off cert=/etc/squid/dummy.pem
+          acl allowed dstdomain wyobiz.wyo.gov ${PaymentHost} ${SiteHost}
+          acl SSL_ports port 443
+          acl CONNECT method CONNECT
+          http_access deny !CONNECT
+          http_access deny CONNECT !SSL_ports
+          http_access allow CONNECT allowed
+          http_access deny all
+          acl step1 at_step SslBump1
+          acl sni_ok ssl::server_name wyobiz.wyo.gov ${PaymentHost} ${SiteHost}
+          ssl_bump peek step1
+          ssl_bump splice sni_ok
+          ssl_bump terminate all
+          on_unsupported_protocol tunnel all
+          access_log daemon:/var/log/squid/access.log
+          CONF
+          openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=unused -keyout /etc/squid/dummy.pem -out /etc/squid/dummy.pem
+          systemctl restart squid
+  ProxyEipAssoc: { Type: AWS::EC2::EIPAssociation, Properties: { InstanceId: !Ref Proxy, AllocationId: !GetAtt ProxyEip.AllocationId } }
+
+  # ---------- audit and alarms ----------
+  TrailBucket: { Type: AWS::S3::Bucket, DeletionPolicy: Retain, Properties: { VersioningConfiguration: { Status: Enabled }, PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true } } }
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Statement:
+          - { Effect: Allow, Principal: { Service: cloudtrail.amazonaws.com }, Action: s3:GetBucketAcl, Resource: !GetAtt TrailBucket.Arn }
+          - { Effect: Allow, Principal: { Service: cloudtrail.amazonaws.com }, Action: s3:PutObject, Resource: !Sub '${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*', Condition: { StringEquals: { 's3:x-amz-acl': bucket-owner-full-control } } }
+  TrailLogs: { Type: AWS::Logs::LogGroup, Properties: { RetentionInDays: 365 } }
+  TrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Statement: [{ Effect: Allow, Principal: { Service: cloudtrail.amazonaws.com }, Action: sts:AssumeRole }] }
+      Policies: [{ PolicyName: logs, PolicyDocument: { Statement: [{ Effect: Allow, Action: [logs:CreateLogStream, logs:PutLogEvents], Resource: !GetAtt TrailLogs.Arn }] } }]
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties: { IsLogging: true, S3BucketName: !Ref TrailBucket, IsMultiRegionTrail: true, EnableLogFileValidation: true, CloudWatchLogsLogGroupArn: !GetAtt TrailLogs.Arn, CloudWatchLogsRoleArn: !GetAtt TrailLogsRole.Arn }
+  Alerts: { Type: AWS::SNS::Topic, Properties: { Subscription: [{ Protocol: email, Endpoint: !Ref OwnerEmail }] } }
+  OtherDecryptFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogs
+      # A decrypt with the CARD key, or a read of a card secret, by anyone but the release function's role.
+      FilterPattern: !Sub '{ (($.eventName = "Decrypt" && $.resources[0].ARN = "${CardKey.Arn}") || ($.eventName = "GetSecretValue" && $.requestParameters.secretId = "wyfn/card/*")) && $.userIdentity.sessionContext.sessionIssuer.arn != "${ReleaseRole.Arn}" }'
+      MetricTransformations: [{ MetricNamespace: wyfn, MetricName: other-decrypt, MetricValue: '1' }]
+  OtherDecryptAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: { AlarmDescription: a card decrypt by anything but the release function, Namespace: wyfn, MetricName: other-decrypt, Statistic: Sum, Period: 60, EvaluationPeriods: 1, Threshold: 0, ComparisonOperator: GreaterThanThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref Alerts] }
+  KeyPolicyFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TrailLogs
+      FilterPattern: '{ ($.eventSource = "kms.amazonaws.com") && (($.eventName = "PutKeyPolicy") || ($.eventName = "ScheduleKeyDeletion") || ($.eventName = "DisableKey")) }'
+      MetricTransformations: [{ MetricNamespace: wyfn, MetricName: key-change, MetricValue: '1' }]
+  KeyPolicyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties: { AlarmDescription: the card key's policy changed or deletion was scheduled, Namespace: wyfn, MetricName: key-change, Statistic: Sum, Period: 60, EvaluationPeriods: 1, Threshold: 0, ComparisonOperator: GreaterThanThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref Alerts] }
+
+Outputs:
+  ProxyAddress: { Value: !GetAtt Proxy.PrivateIp, Description: set as WYFN_PROXY=http://<this>:3128 in the worker image's /etc/wyfn/worker.env }
+  ReleaseFunctionName: { Value: !Ref ReleaseFunction }
+  WorkerKeySecretArn: { Value: !Ref WorkerKeySecret, Description: copy its value into Netlify as WORKER_API_KEY (secret-to-secret, never into chat) }
