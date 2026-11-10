@@ -6,13 +6,13 @@
 # whose policies allow this account's own resources. No AWS hostname is on the proxy allowlist: a shared AWS API
 # endpoint reachable through the proxy would let a compromised worker send data into an attacker's own account.
 AWSTemplateFormatVersion: '2010-09-09'
-Description: WYFN filing worker, card release function, grant ledger, alerting (single-purpose account)
+Description: 'WYFN filing worker, card release function, grant ledger, alerting, backups (single-purpose account)'
 
 Parameters:
   OwnerEmail: { Type: String, Default: hello@bkhomephotos.com }
-  WorkerAmiId: { Type: AWS::EC2::Image::Id, Description: The approved worker image (EC2 Image Builder output, one per release) }
+  WorkerAmiId: { Type: AWS::EC2::Image::Id, Description: 'The approved worker image (EC2 Image Builder output, one per release)' }
   ProxyAmiId: { Type: AWS::EC2::Image::Id, Description: Ubuntu 24.04 arm64 for the proxy }
-  PaymentHost: { Type: String, Description: The payment page's exact host, recorded in Phase 0 (e.g. www.convergepay.com) }
+  PaymentHost: { Type: String, Description: "The payment page's exact host, recorded in Phase 0 (e.g. www.convergepay.com)" }
   SiteHost: { Type: String, Default: wyfilingnotices.com }
 
 Resources:
@@ -48,7 +48,7 @@ Resources:
   ProxyIngress: { Type: AWS::EC2::SecurityGroupIngress, Properties: { GroupId: !Ref ProxySg, IpProtocol: tcp, FromPort: 3128, ToPort: 3128, SourceSecurityGroupId: !Ref WorkerSg } }
   EndpointSg:
     Type: AWS::EC2::SecurityGroup
-    Properties: { VpcId: !Ref Vpc, GroupDescription: VPC endpoints - in from the worker only, SecurityGroupEgress: [{ IpProtocol: '-1', CidrIp: 127.0.0.1/32 }] }
+    Properties: { VpcId: !Ref Vpc, GroupDescription: 'VPC endpoints - in from the worker only', SecurityGroupEgress: [{ IpProtocol: '-1', CidrIp: 127.0.0.1/32 }] }
   EndpointIngress: { Type: AWS::EC2::SecurityGroupIngress, Properties: { GroupId: !Ref EndpointSg, IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref WorkerSg } }
 
   # Endpoints, one AZ each (about $7.30 a month each). Their policies admit only this account's own resources.
@@ -79,13 +79,14 @@ Resources:
   CardKey:
     Type: AWS::KMS::Key
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       Description: decrypts card secrets; usable by the release function only
       PendingWindowInDays: 30
       EnableKeyRotation: true
       KeyPolicy:
         Statement:
-          - { Sid: Admin, Effect: Allow, Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }, Action: ['kms:Create*', 'kms:Describe*', 'kms:Enable*', 'kms:List*', 'kms:Put*', 'kms:Update*', 'kms:Revoke*', 'kms:Disable*', 'kms:Get*', 'kms:Delete*', 'kms:TagResource', 'kms:UntagResource', 'kms:ScheduleKeyDeletion', 'kms:CancelKeyDeletion', 'kms:Encrypt'], Resource: '*' }
+          - { Sid: Admin, Effect: Allow, Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }, Action: ['kms:Create*', 'kms:Describe*', 'kms:Enable*', 'kms:List*', 'kms:Put*', 'kms:Update*', 'kms:Revoke*', 'kms:Disable*', 'kms:Get*', 'kms:Delete*', 'kms:TagResource', 'kms:UntagResource', 'kms:ScheduleKeyDeletion', 'kms:CancelKeyDeletion', 'kms:Encrypt', 'kms:GenerateDataKey'], Resource: '*' }
           - { Sid: ReleaseDecrypt, Effect: Allow, Principal: { AWS: !GetAtt ReleaseRole.Arn }, Action: kms:Decrypt, Resource: '*' }
           # Nothing else may decrypt, whatever an IAM policy says (the account root keeps admin, not use).
           - Sid: DenyOtherDecrypt
@@ -115,6 +116,7 @@ Resources:
   Ledger:
     Type: AWS::DynamoDB::Table
     DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: wyfn-release
       BillingMode: PAY_PER_REQUEST
@@ -133,7 +135,8 @@ Resources:
         - PolicyName: release
           PolicyDocument:
             Statement:
-              - { Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: [!Ref CardPrimarySecret, !Ref CardBackupSecret] }
+              # By name, not !Ref: the card key's policy names this role, so a reference back would be a cycle.
+              - { Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:wyfn/card/*' }
               - { Effect: Allow, Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:ConditionCheckItem], Resource: !GetAtt Ledger.Arn }
   ReleaseFunction:
     Type: AWS::Lambda::Function
@@ -227,8 +230,44 @@ Resources:
           systemctl restart squid
   ProxyEipAssoc: { Type: AWS::EC2::EIPAssociation, Properties: { InstanceId: !Ref Proxy, AllocationId: !GetAtt ProxyEip.AllocationId } }
 
+  # ---------- backups: the site's hourly encrypted copies (wyfilingnotices netlify/lib/backup.ts) ----------
+  # Each file is encrypted on the site to BK's backup PUBLIC key; only his private key (kept offline) opens them. The
+  # site's key below may only PUT under v1/: it can't read, list or delete. Every version is kept and locked for 35
+  # days (Object Lock, governance mode), so a site that was taken over can't erase or replace what is already here.
+  BackupBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ObjectLockEnabled: true
+      ObjectLockConfiguration: { ObjectLockEnabled: Enabled, Rule: { DefaultRetention: { Mode: GOVERNANCE, Days: 35 } } }
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption: { ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }] }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      LifecycleConfiguration:
+        Rules:
+          # Manifests: six months of history (latest.bin is rewritten at least daily, so it never expires). Packs are
+          # kept: the current manifest may still need an old one.
+          - { Id: manifests, Status: Enabled, Prefix: v1/manifests/, ExpirationInDays: 180, NoncurrentVersionExpiration: { NoncurrentDays: 90 } }
+  BackupBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BackupBucket
+      PolicyDocument:
+        Statement:
+          - { Sid: TlsOnly, Effect: Deny, Principal: '*', Action: 's3:*', Resource: [!GetAtt BackupBucket.Arn, !Sub '${BackupBucket.Arn}/*'], Condition: { Bool: { 'aws:SecureTransport': 'false' } } }
+  # The site's identity for backups. BK creates its access key in the IAM console (Users > this user > Security
+  # credentials > Create access key) and pastes it into Netlify as BACKUP_AWS_ACCESS_KEY_ID / _SECRET_ACCESS_KEY.
+  SiteBackupUser:
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyName: put-backups-only
+          PolicyDocument: { Statement: [{ Effect: Allow, Action: s3:PutObject, Resource: !Sub '${BackupBucket.Arn}/v1/*' }] }
+
   # ---------- audit and alarms ----------
-  TrailBucket: { Type: AWS::S3::Bucket, DeletionPolicy: Retain, Properties: { VersioningConfiguration: { Status: Enabled }, PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true } } }
+  TrailBucket: { Type: AWS::S3::Bucket, DeletionPolicy: Retain, UpdateReplacePolicy: Retain, Properties: { VersioningConfiguration: { Status: Enabled }, PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true } } }
   TrailBucketPolicy:
     Type: AWS::S3::BucketPolicy
     Properties:
@@ -257,7 +296,7 @@ Resources:
       MetricTransformations: [{ MetricNamespace: wyfn, MetricName: other-decrypt, MetricValue: '1' }]
   OtherDecryptAlarm:
     Type: AWS::CloudWatch::Alarm
-    Properties: { AlarmDescription: a card decrypt by anything but the release function, Namespace: wyfn, MetricName: other-decrypt, Statistic: Sum, Period: 60, EvaluationPeriods: 1, Threshold: 0, ComparisonOperator: GreaterThanThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref Alerts] }
+    Properties: { AlarmDescription: 'a card decrypt by anything but the release function', Namespace: wyfn, MetricName: other-decrypt, Statistic: Sum, Period: 60, EvaluationPeriods: 1, Threshold: 0, ComparisonOperator: GreaterThanThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref Alerts] }
   KeyPolicyFilter:
     Type: AWS::Logs::MetricFilter
     Properties:
@@ -266,9 +305,11 @@ Resources:
       MetricTransformations: [{ MetricNamespace: wyfn, MetricName: key-change, MetricValue: '1' }]
   KeyPolicyAlarm:
     Type: AWS::CloudWatch::Alarm
-    Properties: { AlarmDescription: the card key's policy changed or deletion was scheduled, Namespace: wyfn, MetricName: key-change, Statistic: Sum, Period: 60, EvaluationPeriods: 1, Threshold: 0, ComparisonOperator: GreaterThanThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref Alerts] }
+    Properties: { AlarmDescription: "the card key's policy changed or deletion was scheduled", Namespace: wyfn, MetricName: key-change, Statistic: Sum, Period: 60, EvaluationPeriods: 1, Threshold: 0, ComparisonOperator: GreaterThanThreshold, TreatMissingData: notBreaching, AlarmActions: [!Ref Alerts] }
 
 Outputs:
+  BackupBucketName: { Value: !Ref BackupBucket, Description: 'set as BACKUP_S3_BUCKET in Netlify (BACKUP_S3_REGION: us-east-1)' }
+  SiteBackupUserName: { Value: !Ref SiteBackupUser, Description: 'create its access key in IAM and paste it into Netlify as BACKUP_AWS_ACCESS_KEY_ID and BACKUP_AWS_SECRET_ACCESS_KEY' }
   ProxyAddress: { Value: !GetAtt Proxy.PrivateIp, Description: set as WYFN_PROXY=http://<this>:3128 in the worker image's /etc/wyfn/worker.env }
   ReleaseFunctionName: { Value: !Ref ReleaseFunction }
-  WorkerKeySecretArn: { Value: !Ref WorkerKeySecret, Description: copy its value into Netlify as WORKER_API_KEY (secret-to-secret, never into chat) }
+  WorkerKeySecretArn: { Value: !Ref WorkerKeySecret, Description: 'copy its value into Netlify as WORKER_API_KEY (secret-to-secret, never into chat)' }
