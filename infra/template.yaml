@@ -171,15 +171,24 @@ Resources:
         MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
         NetworkInterfaces: [{ DeviceIndex: 0, AssociatePublicIpAddress: false, Groups: [!Ref WorkerSg] }]
         BlockDeviceMappings: [{ DeviceName: /dev/sda1, Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true } }]
+  # The worker runs only in payment hours (the site's own payment-hours setting is the same 8am to 8pm New York):
+  # billed by the hour, so half the day off is half the server cost. Replaced automatically if it fails meanwhile.
   WorkerGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
     Properties:
-      MinSize: '1'
+      MinSize: '0'
       MaxSize: '1'
-      DesiredCapacity: '1'
+      DesiredCapacity: '0'
       VPCZoneIdentifier: [!Ref WorkerSubnetA, !Ref WorkerSubnetB]
       LaunchTemplate: { LaunchTemplateId: !Ref WorkerTemplate, Version: !GetAtt WorkerTemplate.LatestVersionNumber }
       HealthCheckType: EC2
+
+  WorkerOn:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties: { AutoScalingGroupName: !Ref WorkerGroup, Recurrence: '45 7 * * *', TimeZone: America/New_York, MinSize: 1, MaxSize: 1, DesiredCapacity: 1 }
+  WorkerOff:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties: { AutoScalingGroupName: !Ref WorkerGroup, Recurrence: '15 20 * * *', TimeZone: America/New_York, MinSize: 0, MaxSize: 1, DesiredCapacity: 0 }
 
   # ---------- the egress proxy (Squid: CONNECT only to the allowlist, SNI must equal the CONNECT host) ----------
   ProxyEip: { Type: AWS::EC2::EIP }
