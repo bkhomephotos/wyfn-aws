@@ -10,10 +10,16 @@ Description: 'WYFN filing worker, card release function, grant ledger, alerting,
 
 Parameters:
   OwnerEmail: { Type: String, Default: hello@bkhomephotos.com }
-  WorkerAmiId: { Type: AWS::EC2::Image::Id, Description: 'The approved worker image (EC2 Image Builder output, one per release)' }
+  # BK's approval of a worker release: the full commit id of a worker-v* tag in wyfn-filing-worker. Empty: no worker
+  # image is built and no worker runs. Changing it (Update stack) is the ONLY way new worker code reaches AWS.
+  WorkerCommit: { Type: String, Default: '', AllowedPattern: '^([0-9a-f]{40})?$', Description: 'Approved worker release commit (40 hex characters), or empty' }
+  WorkerBaseImage: { Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>', Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id, Description: 'Ubuntu 24.04 base for the worker image (resolved when the stack is updated)' }
   ProxyAmiId: { Type: AWS::EC2::Image::Id, Description: Ubuntu 24.04 arm64 for the proxy }
   PaymentHost: { Type: String, Description: "The payment page's exact host, recorded in Phase 0 (e.g. www.convergepay.com)" }
   SiteHost: { Type: String, Default: wyfilingnotices.com }
+
+Conditions:
+  HasWorker: !Not [!Equals [!Ref WorkerCommit, '']]
 
 Resources:
   # ---------- network ----------
@@ -26,6 +32,11 @@ Resources:
   ProxyRoutes: { Type: AWS::EC2::RouteTable, Properties: { VpcId: !Ref Vpc } }
   ProxyDefault: { Type: AWS::EC2::Route, DependsOn: IgwAttach, Properties: { RouteTableId: !Ref ProxyRoutes, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref Igw } }
   ProxyRoutesAssoc: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref ProxySubnet, RouteTableId: !Ref ProxyRoutes } }
+  # Image builds only: a temporary build instance with a public address (it downloads the pinned inputs), terminated
+  # when the build ends. Nothing else runs here.
+  BuildSubnet: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.20.0/24, AvailabilityZone: !Select [0, !GetAZs ''], MapPublicIpOnLaunch: true } }
+  BuildRoutesAssoc: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref BuildSubnet, RouteTableId: !Ref ProxyRoutes } }
+  BuildSg: { Type: AWS::EC2::SecurityGroup, Properties: { VpcId: !Ref Vpc, GroupDescription: 'image builds - no inbound' } }
   # The worker subnets have NO route to the internet at all: only the VPC (proxy, endpoints).
   WorkerRoutes: { Type: AWS::EC2::RouteTable, Properties: { VpcId: !Ref Vpc } }
   WorkerAssocA: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref WorkerSubnetA, RouteTableId: !Ref WorkerRoutes } }
@@ -166,9 +177,28 @@ Resources:
   WorkerProfile: { Type: AWS::IAM::InstanceProfile, Properties: { Roles: [!Ref WorkerRole] } }
   WorkerTemplate:
     Type: AWS::EC2::LaunchTemplate
+    Condition: HasWorker
     Properties:
       LaunchTemplateData:
-        ImageId: !Ref WorkerAmiId
+        ImageId: !GetAtt WorkerImage.ImageId
+        # The worker's settings (none secret; the worker key is read from Secrets Manager), written at every boot.
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -euo pipefail
+            install -d -m 0755 /etc/wyfn
+            cat > /etc/wyfn/worker.env <<EOF
+            WYFN_SITE=https://${SiteHost}
+            WYFN_WORKER_ID=aws-worker-1
+            WYFN_REGION=${AWS::Region}
+            WYFN_RELEASE_FN=${ReleaseFunction}
+            WYFN_WORKER_KEY_ID=${WorkerKeySecret}
+            WYFN_PROXY=http://${Proxy.PrivateIp}:3128
+            CHROME_PATH=/opt/chromium/chrome-linux64/chrome
+            WYFN_LIVE=1
+            EOF
+            chmod 0644 /etc/wyfn/worker.env
+            systemctl restart wyfn-worker.service
         InstanceType: t3.medium
         IamInstanceProfile: { Arn: !GetAtt WorkerProfile.Arn }
         MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
@@ -178,6 +208,7 @@ Resources:
   # billed by the hour, so half the day off is half the server cost. Replaced automatically if it fails meanwhile.
   WorkerGroup:
     Type: AWS::AutoScaling::AutoScalingGroup
+    Condition: HasWorker
     Properties:
       MinSize: '0'
       MaxSize: '1'
@@ -188,10 +219,103 @@ Resources:
 
   WorkerOn:
     Type: AWS::AutoScaling::ScheduledAction
+    Condition: HasWorker
     Properties: { AutoScalingGroupName: !Ref WorkerGroup, Recurrence: '45 7 * * *', TimeZone: America/New_York, MinSize: 1, MaxSize: 1, DesiredCapacity: 1 }
   WorkerOff:
     Type: AWS::AutoScaling::ScheduledAction
+    Condition: HasWorker
     Properties: { AutoScalingGroupName: !Ref WorkerGroup, Recurrence: '15 20 * * *', TimeZone: America/New_York, MinSize: 0, MaxSize: 1, DesiredCapacity: 0 }
+
+  # ---------- worker releases: EC2 Image Builder, from the one commit BK approved (WorkerCommit) ----------
+  # BK creates the secret's value himself: a fine-grained GitHub token with read-only "Contents" on
+  # bkhomephotos/wyfn-filing-worker and nothing else. Only the temporary build instance can read it.
+  GitHubReadSecret: { Type: AWS::SecretsManager::Secret, Properties: { Name: wyfn/github-read, Description: 'Read-only GitHub token for worker builds. Value set by BK in the console' } }
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: { Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }] }
+      # Image Builder drives its build instances through Systems Manager; the worker itself has neither.
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore, arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder]
+      Policies: [{ PolicyName: github-token, PolicyDocument: { Statement: [{ Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref GitHubReadSecret }] } }]
+  BuildProfile: { Type: AWS::IAM::InstanceProfile, Properties: { Roles: [!Ref BuildRole] } }
+  WorkerBuildInfra:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: wyfn-worker-build
+      InstanceProfileName: !Ref BuildProfile
+      InstanceTypes: [t3.medium]
+      SubnetId: !Ref BuildSubnet
+      SecurityGroupIds: [!Ref BuildSg]
+      TerminateInstanceOnFailure: true
+      InstanceMetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1 }
+  # Bump Version whenever Data changes (components can't be changed in place).
+  WorkerBuildComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: wyfn-worker-from-commit
+      Version: 1.0.0
+      Platform: Linux
+      Description: Builds the filing worker from one approved commit of wyfn-filing-worker (image/build.sh)
+      Data: |
+        name: wyfn-worker-from-commit
+        schemaVersion: 1.0
+        parameters:
+          - Commit:
+              type: string
+              description: the approved release commit (40 hex characters)
+          - Region:
+              type: string
+              description: where the GitHub token secret is
+        phases:
+          - name: build
+            steps:
+              - name: BuildFromCommit
+                action: ExecuteBash
+                timeoutSeconds: 3600
+                inputs:
+                  commands:
+                    - |
+                      set -euo pipefail
+                      COMMIT='{{ Commit }}'
+                      [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "not a commit id"; exit 1; }
+                      export DEBIAN_FRONTEND=noninteractive
+                      apt-get update && apt-get -y install --no-install-recommends git ca-certificates curl
+                      snap install aws-cli --classic
+                      TOKEN=$(/snap/bin/aws secretsmanager get-secret-value --region '{{ Region }}' --secret-id wyfn/github-read --query SecretString --output text)
+                      AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0); unset TOKEN
+                      REPO=https://github.com/bkhomephotos/wyfn-filing-worker.git
+                      rm -rf /tmp/src && mkdir /tmp/src && cd /tmp/src && git init -q
+                      git -c http.extraHeader="Authorization: Basic $AUTH" fetch -q --depth 1 "$REPO" "$COMMIT"
+                      git -c http.extraHeader="Authorization: Basic $AUTH" ls-remote --tags "$REPO" 'refs/tags/worker-v*' > /tmp/tags
+                      unset AUTH
+                      git checkout -q FETCH_HEAD
+                      [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "fetched another commit"; exit 1; }
+                      TAG=$(awk -v c="$COMMIT" '$1 == c { t = $2; sub("refs/tags/", "", t); sub(/\^\{\}$/, "", t); print t; exit }' /tmp/tags)
+                      [ -n "$TAG" ] || { echo "$COMMIT carries no worker-v* release tag"; exit 1; }
+                      RELEASE="$TAG ($COMMIT)" bash image/build.sh
+                      cd / && rm -rf /tmp/src /tmp/tags
+                      snap remove aws-cli
+  WorkerRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Condition: HasWorker
+    Properties:
+      # The commit and base image are in the name: a new approval (or a new Ubuntu base) is a new recipe.
+      Name: !Sub 'wyfn-worker-${WorkerCommit}-${WorkerBaseImage}'
+      Version: 1.0.0
+      ParentImage: !Ref WorkerBaseImage
+      Components:
+        - ComponentArn: !GetAtt WorkerBuildComponent.Arn
+          Parameters: [{ Name: Commit, Value: [!Ref WorkerCommit] }, { Name: Region, Value: [!Ref 'AWS::Region'] }]
+      BlockDeviceMappings: [{ DeviceName: /dev/sda1, Ebs: { VolumeSize: 30, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true } }]
+  WorkerImage:
+    Type: AWS::ImageBuilder::Image
+    Condition: HasWorker
+    Properties:
+      ImageRecipeArn: !GetAtt WorkerRecipe.Arn
+      InfrastructureConfigurationArn: !GetAtt WorkerBuildInfra.Arn
+      ImageTestsConfiguration: { ImageTestsEnabled: false }
+      EnhancedImageMetadataEnabled: true
+      Tags: { wyfn-worker-commit: !Ref WorkerCommit }
 
   # ---------- the egress proxy (Squid: CONNECT only to the allowlist, SNI must equal the CONNECT host) ----------
   ProxyEip: { Type: AWS::EC2::EIP }
@@ -310,6 +434,7 @@ Resources:
 Outputs:
   BackupBucketName: { Value: !Ref BackupBucket, Description: 'set as BACKUP_S3_BUCKET in Netlify (BACKUP_S3_REGION: us-east-1)' }
   SiteBackupUserName: { Value: !Ref SiteBackupUser, Description: 'create its access key in IAM and paste it into Netlify as BACKUP_AWS_ACCESS_KEY_ID and BACKUP_AWS_SECRET_ACCESS_KEY' }
-  ProxyAddress: { Value: !GetAtt Proxy.PrivateIp, Description: set as WYFN_PROXY=http://<this>:3128 in the worker image's /etc/wyfn/worker.env }
+  ProxyAddress: { Value: !GetAtt Proxy.PrivateIp, Description: 'the egress proxy (the launch template writes it into the worker''s /etc/wyfn/worker.env)' }
+  WorkerImageId: { Condition: HasWorker, Value: !GetAtt WorkerImage.ImageId, Description: 'the worker image built from WorkerCommit' }
   ReleaseFunctionName: { Value: !Ref ReleaseFunction }
   WorkerKeySecretArn: { Value: !Ref WorkerKeySecret, Description: 'copy its value into Netlify as WORKER_API_KEY (secret-to-secret, never into chat)' }
