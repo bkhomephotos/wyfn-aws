@@ -111,13 +111,27 @@ Resources:
         Statement:
           - { Sid: Admin, Effect: Allow, Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }, Action: ['kms:Create*', 'kms:Describe*', 'kms:Enable*', 'kms:List*', 'kms:Put*', 'kms:Update*', 'kms:Revoke*', 'kms:Disable*', 'kms:Get*', 'kms:Delete*', 'kms:TagResource', 'kms:UntagResource', 'kms:ScheduleKeyDeletion', 'kms:CancelKeyDeletion', 'kms:Encrypt', 'kms:GenerateDataKey'], Resource: '*' }
           - { Sid: ReleaseDecrypt, Effect: Allow, Principal: { AWS: !GetAtt ReleaseRole.Arn }, Action: kms:Decrypt, Resource: '*' }
-          # Nothing else may decrypt, whatever an IAM policy says (the account root keeps admin, not use).
+          # Secrets Manager's key check: when a secret is created with this key (or moved to it), Secrets Manager calls
+          # GenerateDataKey and Decrypt as the caller, with SecretVersionId "RequestToValidateKeyAccess" in the
+          # encryption context, to confirm access (the first create failed without this, Nov 22, 2026). KMS binds the
+          # context to the ciphertext, so this decrypts only the throwaway check key: a card version is encrypted under
+          # its own version id, and a version id can't be that string (version ids are 32 to 64 characters).
+          - Sid: SecretsManagerKeyCheck
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }
+            Action: kms:Decrypt
+            Resource: '*'
+            Condition: { StringEquals: { 'kms:ViaService': !Sub 'secretsmanager.${AWS::Region}.amazonaws.com', 'kms:EncryptionContext:SecretVersionId': RequestToValidateKeyAccess } }
+          # Nothing else may decrypt, whatever an IAM policy says (the account root keeps admin, not use). A missing
+          # context key counts as "not equal", so a decrypt with no encryption context is denied too.
           - Sid: DenyOtherDecrypt
             Effect: Deny
             Principal: '*'
             Action: kms:Decrypt
             Resource: '*'
-            Condition: { ArnNotEquals: { 'aws:PrincipalArn': !GetAtt ReleaseRole.Arn } }
+            Condition:
+              ArnNotEquals: { 'aws:PrincipalArn': !GetAtt ReleaseRole.Arn }
+              StringNotEquals: { 'kms:EncryptionContext:SecretVersionId': RequestToValidateKeyAccess }
   CardKeyAlias: { Type: AWS::KMS::Alias, Properties: { AliasName: alias/wyfn-card, TargetKeyId: !Ref CardKey } }
   CardPrimarySecret: { Type: AWS::SecretsManager::Secret, Properties: { Name: wyfn/card/chase, KmsKeyId: !Ref CardKey, Description: 'Chase employee card. Value set by BK with scripts/card-provision.sh, never by anything else' } }
   CardBackupSecret: { Type: AWS::SecretsManager::Secret, Properties: { Name: wyfn/card/debit, KmsKeyId: !Ref CardKey, Description: 'Virtual debit card. Value set by BK with scripts/card-provision.sh' } }
@@ -430,8 +444,11 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       LogGroupName: !Ref TrailLogs
-      # A decrypt with the CARD key, or a read of a card secret, by anyone but the release function's role.
-      FilterPattern: !Sub '{ (($.eventName = "Decrypt" && $.resources[0].ARN = "${CardKey.Arn}") || ($.eventName = "GetSecretValue" && $.requestParameters.secretId = "wyfn/card/*")) && $.userIdentity.sessionContext.sessionIssuer.arn != "${ReleaseRole.Arn}" }'
+      # A decrypt with the CARD key, or a read of a card secret, by anyone but the release function's role. Secrets
+      # Manager's key check (see the key policy) is not a read of a card and is left out. A field that is absent never
+      # matches "!=", hence NOT EXISTS: a decrypt with no encryption context still counts, and so does an IAM user or
+      # root (no sessionIssuer), not only roles.
+      FilterPattern: !Sub '{ (($.eventName = "Decrypt" && $.resources[0].ARN = "${CardKey.Arn}" && ($.requestParameters.encryptionContext.SecretVersionId NOT EXISTS || $.requestParameters.encryptionContext.SecretVersionId != "RequestToValidateKeyAccess")) || ($.eventName = "GetSecretValue" && $.requestParameters.secretId = "wyfn/card/*")) && ($.userIdentity.sessionContext.sessionIssuer.arn NOT EXISTS || $.userIdentity.sessionContext.sessionIssuer.arn != "${ReleaseRole.Arn}") }'
       MetricTransformations: [{ MetricNamespace: wyfn, MetricName: other-decrypt, MetricValue: '1' }]
   OtherDecryptAlarm:
     Type: AWS::CloudWatch::Alarm
