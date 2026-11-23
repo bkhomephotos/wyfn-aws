@@ -35,9 +35,10 @@ Conditions:
 Resources:
   # ---------- network ----------
   Vpc: { Type: AWS::EC2::VPC, Properties: { CidrBlock: 10.40.0.0/16, EnableDnsSupport: true, EnableDnsHostnames: true } }
-  WorkerSubnetA: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.1.0/24, AvailabilityZone: !Select [0, !GetAZs ''] } }
-  WorkerSubnetB: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.2.0/24, AvailabilityZone: !Select [1, !GetAZs ''] } }
-  ProxySubnet: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.10.0/24, AvailabilityZone: !Select [0, !GetAZs ''] } }
+  # Zones b and c, not a: on Nov 22, 2026 us-east-1a had no t4g.nano capacity for the proxy (and AWS named b, c, d, f).
+  WorkerSubnetA: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.1.0/24, AvailabilityZone: !Select [1, !GetAZs ''] } }
+  WorkerSubnetB: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.2.0/24, AvailabilityZone: !Select [2, !GetAZs ''] } }
+  ProxySubnet: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.10.0/24, AvailabilityZone: !Select [1, !GetAZs ''] } }
   Igw: { Type: AWS::EC2::InternetGateway }
   IgwAttach: { Type: AWS::EC2::VPCGatewayAttachment, Properties: { VpcId: !Ref Vpc, InternetGatewayId: !Ref Igw } }
   ProxyRoutes: { Type: AWS::EC2::RouteTable, Properties: { VpcId: !Ref Vpc } }
@@ -45,7 +46,7 @@ Resources:
   ProxyRoutesAssoc: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref ProxySubnet, RouteTableId: !Ref ProxyRoutes } }
   # Image builds only: a temporary build instance with a public address (it downloads the pinned inputs), terminated
   # when the build ends. Nothing else runs here.
-  BuildSubnet: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.20.0/24, AvailabilityZone: !Select [0, !GetAZs ''], MapPublicIpOnLaunch: true } }
+  BuildSubnet: { Type: AWS::EC2::Subnet, Properties: { VpcId: !Ref Vpc, CidrBlock: 10.40.20.0/24, AvailabilityZone: !Select [1, !GetAZs ''], MapPublicIpOnLaunch: true } }
   BuildRoutesAssoc: { Type: AWS::EC2::SubnetRouteTableAssociation, Properties: { SubnetId: !Ref BuildSubnet, RouteTableId: !Ref ProxyRoutes } }
   BuildSg: { Type: AWS::EC2::SecurityGroup, Properties: { VpcId: !Ref Vpc, GroupDescription: 'image builds - no inbound' } }
   # The worker subnets have NO route to the internet at all: only the VPC (proxy, endpoints).
