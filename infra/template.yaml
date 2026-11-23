@@ -215,6 +215,10 @@ Resources:
       LaunchTemplateData:
         ImageId: !GetAtt WorkerImage.ImageId
         # The worker's settings (none secret; the worker key is read from Secrets Manager), written at every boot.
+        # The worker subnets have no route out: the browser goes through the proxy by its own setting, and the worker's
+        # own calls to the site (Node's fetch) through NODE_USE_ENV_PROXY (Node 24). Instance metadata and the AWS
+        # endpoints (private DNS to the VPC endpoints) stay direct. Without this the first worker (Nov 23, 2026) could
+        # never reach the site to ask for a job.
         UserData:
           Fn::Base64: !Sub |
             #!/bin/bash
@@ -229,6 +233,10 @@ Resources:
             WYFN_PROXY=http://${Proxy.PrivateIp}:3128
             CHROME_PATH=/opt/chromium/chrome-linux64/chrome
             WYFN_LIVE=1
+            NODE_USE_ENV_PROXY=1
+            HTTPS_PROXY=http://${Proxy.PrivateIp}:3128
+            HTTP_PROXY=http://${Proxy.PrivateIp}:3128
+            NO_PROXY=169.254.169.254,.amazonaws.com
             EOF
             chmod 0644 /etc/wyfn/worker.env
             systemctl restart wyfn-worker.service
