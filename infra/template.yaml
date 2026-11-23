@@ -14,9 +14,20 @@ Parameters:
   # image is built and no worker runs. Changing it (Update stack) is the ONLY way new worker code reaches AWS.
   WorkerCommit: { Type: String, Default: '', AllowedPattern: '^([0-9a-f]{40})?$', Description: 'Approved worker release commit (40 hex characters), or empty' }
   WorkerBaseImage: { Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>', Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id, Description: 'Ubuntu 24.04 base for the worker image (resolved when the stack is updated)' }
-  ProxyAmiId: { Type: AWS::EC2::Image::Id, Description: Ubuntu 24.04 arm64 for the proxy }
-  PaymentHost: { Type: String, Description: "The payment page's exact host, recorded in Phase 0 (e.g. www.convergepay.com)" }
-  SiteHost: { Type: String, Default: wyfilingnotices.com }
+  # Canonical's current Ubuntu 24.04 arm64 image, looked up when the stack is created or updated (nothing to paste).
+  # An update after Canonical publishes a newer image replaces the proxy with a patched one; the worker's launch
+  # template follows its new private address in the same update.
+  ProxyAmiId: { Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>', Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id, Description: 'Ubuntu 24.04 arm64 for the proxy (resolved when the stack is created or updated)' }
+  # Recorded in Phase 0 (Nov 22, 2026, BK's manual payment for a real order): Wyoming's payment page is i3 Verticals'
+  # paymentform.webfeepay.com; the card boxes are a TranSafe PaymentFrame iframe served by post.live.transafe.com
+  # (the card number goes straight there); the page's one script library comes from cdn.bisonline.com. Hosts are
+  # exact names, space separated, letters, digits, dots and hyphens only (they are written into the proxy config).
+  PaymentHosts:
+    Type: String
+    Default: paymentform.webfeepay.com post.live.transafe.com cdn.bisonline.com
+    AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+( [a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+){0,5}$'
+    Description: 'The payment page and the card frame hosts, space separated, exact names (Phase 0)'
+  SiteHost: { Type: String, Default: wyfilingnotices.com, AllowedPattern: '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$' }
 
 Conditions:
   HasWorker: !Not [!Equals [!Ref WorkerCommit, '']]
@@ -335,7 +346,7 @@ Resources:
           apt-get update && apt-get -y install squid-openssl
           cat > /etc/squid/squid.conf <<CONF
           http_port 3128 ssl-bump generate-host-certificates=off cert=/etc/squid/dummy.pem
-          acl allowed dstdomain wyobiz.wyo.gov ${PaymentHost} ${SiteHost}
+          acl allowed dstdomain wyobiz.wyo.gov ${PaymentHosts} ${SiteHost}
           acl SSL_ports port 443
           acl CONNECT method CONNECT
           http_access deny !CONNECT
@@ -343,7 +354,7 @@ Resources:
           http_access allow CONNECT allowed
           http_access deny all
           acl step1 at_step SslBump1
-          acl sni_ok ssl::server_name wyobiz.wyo.gov ${PaymentHost} ${SiteHost}
+          acl sni_ok ssl::server_name wyobiz.wyo.gov ${PaymentHosts} ${SiteHost}
           ssl_bump peek step1
           ssl_bump splice sni_ok
           ssl_bump terminate all
