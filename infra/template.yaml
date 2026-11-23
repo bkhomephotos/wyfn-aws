@@ -73,6 +73,9 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties: { VpcId: !Ref Vpc, GroupDescription: 'VPC endpoints - in from the worker only', SecurityGroupEgress: [{ IpProtocol: '-1', CidrIp: 127.0.0.1/32 }] }
   EndpointIngress: { Type: AWS::EC2::SecurityGroupIngress, Properties: { GroupId: !Ref EndpointSg, IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref WorkerSg } }
+  # The temporary image-build instance is in this VPC too, so the endpoint's private DNS catches its one Secrets Manager
+  # call (the GitHub read token). Without this the worker build would hang on it.
+  EndpointIngressBuild: { Type: AWS::EC2::SecurityGroupIngress, Properties: { GroupId: !Ref EndpointSg, IpProtocol: tcp, FromPort: 443, ToPort: 443, SourceSecurityGroupId: !Ref BuildSg } }
 
   # Endpoints, one AZ each (about $7.30 a month each). Their policies admit only this account's own resources.
   LambdaEndpoint:
@@ -96,7 +99,9 @@ Resources:
       SubnetIds: [!Ref WorkerSubnetA]
       SecurityGroupIds: [!Ref EndpointSg]
       PolicyDocument:
-        Statement: [{ Effect: Allow, Principal: '*', Action: secretsmanager:GetSecretValue, Resource: !Ref WorkerKeySecret }]
+        # The worker key (worker) and the GitHub read token (image builds). IAM still decides who: the worker's role can
+        # read only its key, the build role only the token.
+        Statement: [{ Effect: Allow, Principal: '*', Action: secretsmanager:GetSecretValue, Resource: [!Ref WorkerKeySecret, !Ref GitHubReadSecret] }]
 
   # ---------- keys and secrets ----------
   CardKey:
