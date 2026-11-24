@@ -67,7 +67,10 @@ Resources:
     Properties:
       VpcId: !Ref Vpc
       GroupDescription: egress proxy - in from the worker only
-      SecurityGroupEgress: [{ IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }, { IpProtocol: udp, FromPort: 53, ToPort: 53, CidrIp: 10.40.0.2/32 }]
+      # 80: Ubuntu's package mirrors are plain http (every package is signature-checked by apt), for installing Squid
+      # and for security updates. Without it Squid was never installed (Nov 22 to 24, 2026). The worker can't use port
+      # 80 through the proxy: Squid allows only CONNECT to port 443 of the listed hosts.
+      SecurityGroupEgress: [{ IpProtocol: tcp, FromPort: 443, ToPort: 443, CidrIp: 0.0.0.0/0 }, { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }, { IpProtocol: udp, FromPort: 53, ToPort: 53, CidrIp: 10.40.0.2/32 }]
   ProxyIngress: { Type: AWS::EC2::SecurityGroupIngress, Properties: { GroupId: !Ref ProxySg, IpProtocol: tcp, FromPort: 3128, ToPort: 3128, SourceSecurityGroupId: !Ref WorkerSg } }
   EndpointSg:
     Type: AWS::EC2::SecurityGroup
@@ -242,14 +245,25 @@ Resources:
                   WYFN_REGION=${AWS::Region}
                   WYFN_RELEASE_FN=${ReleaseFunction}
                   WYFN_WORKER_KEY_ID=${WorkerKeySecret}
-                  WYFN_PROXY=http://${Proxy.PrivateIp}:3128
+                  WYFN_PROXY=http://${EgressProxy.PrivateIp}:3128
                   CHROME_PATH=/opt/chromium/chrome-linux64/chrome
                   WYFN_LIVE=1
                   NODE_USE_ENV_PROXY=1
-                  HTTPS_PROXY=http://${Proxy.PrivateIp}:3128
-                  HTTP_PROXY=http://${Proxy.PrivateIp}:3128
+                  HTTPS_PROXY=http://${EgressProxy.PrivateIp}:3128
+                  HTTP_PROXY=http://${EgressProxy.PrivateIp}:3128
                   NO_PROXY=169.254.169.254,.amazonaws.com
+              # The worker's log lines also on the console, so EC2's "Get system log" shows why it can't work when it
+              # can't reach the site to say so. Its logger never writes a card value (src/log.ts redacts), and only this
+              # account can read the console.
+              - path: /etc/systemd/system/wyfn-worker.service.d/10-console.conf
+                owner: root:root
+                permissions: '0644'
+                content: |
+                  [Service]
+                  StandardOutput=journal+console
+                  StandardError=journal+console
             runcmd:
+              - [systemctl, daemon-reload]
               - [systemctl, --no-block, start, wyfn-worker.service]
         InstanceType: t3.medium
         IamInstanceProfile: { Arn: !GetAtt WorkerProfile.Arn }
@@ -373,7 +387,9 @@ Resources:
   # ---------- the egress proxy (Squid: CONNECT only to the allowlist, SNI must equal the CONNECT host) ----------
   # AWS::EC2::EIP docs: an address used in a VPC from the same template must depend on the gateway attachment.
   ProxyEip: { Type: AWS::EC2::EIP, DependsOn: IgwAttach, Properties: { Domain: vpc } }
-  Proxy:
+  # Named EgressProxy (was Proxy) so the stack update of Nov 24, 2026 replaces the first one: its setup never installed
+  # Squid (no port 80 out, and no way out at all until the Elastic IP was attached), and user data runs only once.
+  EgressProxy:
     Type: AWS::EC2::Instance
     Properties:
       ImageId: !Ref ProxyAmiId
@@ -385,8 +401,16 @@ Resources:
       UserData:
         Fn::Base64: !Sub |
           #!/bin/bash
-          set -e
-          apt-get update && apt-get -y install squid-openssl
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # The Elastic IP is attached a little after this instance starts, and until then there is no way out: keep
+          # trying for up to 15 minutes. --error-on=any: a mirror that can't be reached is a failure, not a warning.
+          for i in $(seq 1 90); do
+            if apt-get update --error-on=any && apt-get -y install squid-openssl; then break; fi
+            echo "wyfn-proxy: packages not reachable yet (try $i)"
+            sleep 10
+          done
+          command -v squid >/dev/null
           cat > /etc/squid/squid.conf <<CONF
           http_port 3128 ssl-bump generate-host-certificates=off cert=/etc/squid/dummy.pem
           acl allowed dstdomain wyobiz.wyo.gov ${PaymentHosts} ${SiteHost}
@@ -405,8 +429,14 @@ Resources:
           access_log daemon:/var/log/squid/access.log
           CONF
           openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj /CN=unused -keyout /etc/squid/dummy.pem -out /etc/squid/dummy.pem
+          chown proxy:proxy /etc/squid/dummy.pem
+          chmod 0600 /etc/squid/dummy.pem
+          squid -k parse
+          systemctl enable squid
           systemctl restart squid
-  ProxyEipAssoc: { Type: AWS::EC2::EIPAssociation, DependsOn: IgwAttach, Properties: { InstanceId: !Ref Proxy, AllocationId: !GetAtt ProxyEip.AllocationId } }
+          systemctl is-active --quiet squid
+          echo "wyfn-proxy: squid is running"
+  ProxyEipAssoc: { Type: AWS::EC2::EIPAssociation, DependsOn: IgwAttach, Properties: { InstanceId: !Ref EgressProxy, AllocationId: !GetAtt ProxyEip.AllocationId } }
 
   # ---------- backups: the site's hourly encrypted copies (wyfilingnotices netlify/lib/backup.ts) ----------
   # Each file is encrypted on the site to BK's backup PUBLIC key; only his private key (kept offline) opens them. The
@@ -491,7 +521,7 @@ Resources:
 Outputs:
   BackupBucketName: { Value: !Ref BackupBucket, Description: 'set as BACKUP_S3_BUCKET in Netlify (BACKUP_S3_REGION: us-east-1)' }
   SiteBackupUserName: { Value: !Ref SiteBackupUser, Description: 'create its access key in IAM and paste it into Netlify as BACKUP_AWS_ACCESS_KEY_ID and BACKUP_AWS_SECRET_ACCESS_KEY' }
-  ProxyAddress: { Value: !GetAtt Proxy.PrivateIp, Description: 'the egress proxy (the launch template writes it into the worker''s /etc/wyfn/worker.env)' }
+  ProxyAddress: { Value: !GetAtt EgressProxy.PrivateIp, Description: 'the egress proxy (the launch template writes it into the worker''s /etc/wyfn/worker.env)' }
   WorkerImageId: { Condition: HasWorker, Value: !GetAtt WorkerImage.ImageId, Description: 'the worker image built from WorkerCommit' }
   ReleaseFunctionName: { Value: !Ref ReleaseFunction }
   WorkerKeySecretArn: { Value: !Ref WorkerKeySecret, Description: 'copy its value into Netlify as WORKER_API_KEY (secret-to-secret, never into chat)' }
