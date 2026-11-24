@@ -253,7 +253,8 @@ Resources:
     Properties:
       MinSize: '0'
       MaxSize: '1'
-      DesiredCapacity: '0'
+      # No DesiredCapacity: the WorkerOn/WorkerOff schedules own it. With '0' here, the Nov 24, 2026 stack update at
+      # 12:27 PM set the group back to 0 and switched the day's worker off. A new group starts at MinSize (0).
       VPCZoneIdentifier: [!Ref WorkerSubnetA, !Ref WorkerSubnetB]
       LaunchTemplate: { LaunchTemplateId: !Ref WorkerTemplate, Version: !GetAtt WorkerTemplate.LatestVersionNumber }
       HealthCheckType: EC2
