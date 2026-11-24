@@ -214,32 +214,43 @@ Resources:
     Properties:
       LaunchTemplateData:
         ImageId: !GetAtt WorkerImage.ImageId
-        # The worker's settings (none secret; the worker key is read from Secrets Manager), written at every boot.
+        # The worker's settings (none secret; the worker key is read from Secrets Manager).
         # The worker subnets have no route out: the browser goes through the proxy by its own setting, and the worker's
         # own calls to the site (Node's fetch) through NODE_USE_ENV_PROXY (Node 24). Instance metadata and the AWS
         # endpoints (private DNS to the VPC endpoints) stay direct. Without this the first worker (Nov 23, 2026) could
         # never reach the site to ask for a job.
+        #
+        # Cloud-config, not a script: write_files runs in cloud-init's network stage, which systemd finishes before
+        # network-online.target, so the file is there before the worker (After=network-online.target) can start. The
+        # worker image v0.1.0's unit also says After=cloud-final.service, and Ubuntu's cloud-final runs
+        # After=multi-user.target, which wants the worker: an ordering cycle, so at boot systemd drops either the worker's
+        # start or cloud-final (and with it any user-data script), and a script's blocking "systemctl restart" from
+        # inside cloud-final waited on cloud-final forever (TimeoutSec=0). The workers of Nov 23 and 24, 2026 never
+        # started. Now, whichever job systemd drops: the file is already written, the worker starts at boot if its job
+        # survived, and runcmd (cloud-final) starts it without waiting if it didn't. "start", not "restart": a worker
+        # already running (maybe mid-job) is left alone.
         UserData:
           Fn::Base64: !Sub |
-            #!/bin/bash
-            set -euo pipefail
-            install -d -m 0755 /etc/wyfn
-            cat > /etc/wyfn/worker.env <<EOF
-            WYFN_SITE=https://${SiteHost}
-            WYFN_WORKER_ID=aws-worker-1
-            WYFN_REGION=${AWS::Region}
-            WYFN_RELEASE_FN=${ReleaseFunction}
-            WYFN_WORKER_KEY_ID=${WorkerKeySecret}
-            WYFN_PROXY=http://${Proxy.PrivateIp}:3128
-            CHROME_PATH=/opt/chromium/chrome-linux64/chrome
-            WYFN_LIVE=1
-            NODE_USE_ENV_PROXY=1
-            HTTPS_PROXY=http://${Proxy.PrivateIp}:3128
-            HTTP_PROXY=http://${Proxy.PrivateIp}:3128
-            NO_PROXY=169.254.169.254,.amazonaws.com
-            EOF
-            chmod 0644 /etc/wyfn/worker.env
-            systemctl restart wyfn-worker.service
+            #cloud-config
+            write_files:
+              - path: /etc/wyfn/worker.env
+                owner: root:root
+                permissions: '0644'
+                content: |
+                  WYFN_SITE=https://${SiteHost}
+                  WYFN_WORKER_ID=aws-worker-1
+                  WYFN_REGION=${AWS::Region}
+                  WYFN_RELEASE_FN=${ReleaseFunction}
+                  WYFN_WORKER_KEY_ID=${WorkerKeySecret}
+                  WYFN_PROXY=http://${Proxy.PrivateIp}:3128
+                  CHROME_PATH=/opt/chromium/chrome-linux64/chrome
+                  WYFN_LIVE=1
+                  NODE_USE_ENV_PROXY=1
+                  HTTPS_PROXY=http://${Proxy.PrivateIp}:3128
+                  HTTP_PROXY=http://${Proxy.PrivateIp}:3128
+                  NO_PROXY=169.254.169.254,.amazonaws.com
+            runcmd:
+              - [systemctl, --no-block, start, wyfn-worker.service]
         InstanceType: t3.medium
         IamInstanceProfile: { Arn: !GetAtt WorkerProfile.Arn }
         MetadataOptions: { HttpTokens: required, HttpPutResponseHopLimit: 1, HttpEndpoint: enabled }
